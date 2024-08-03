@@ -43,6 +43,8 @@
 #include <memory>
 #include <stdexcept>
 #include <Eigen/Core>
+#include <Eigen/Dense>
+#include <Eigen/Eigenvalues>
 #include <nanoflann.hpp>
 
 namespace llb_features {
