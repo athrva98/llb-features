@@ -68,15 +68,7 @@ Create a build directory and run CMake:
 ```bash
 mkdir build
 cd build
-cmake .. -DEIGEN3_CMAKE_DIR=/path/to/eigen/cmake -DNANOFLANN_CMAKE_DIR=/path/to/nanoflann/cmake
-```
-
-Replace `/path/to/eigen/cmake` and `/path/to/nanoflann/cmake` with the actual paths to the CMake configuration directories for Eigen and nanoflann on your system.
-
-For example:
-
-```bash
-cmake .. -DEIGEN3_CMAKE_DIR="C:\Libraries\eigen-3.4.0\share\eigen3\cmake" -DNANOFLANN_CMAKE_DIR="C:\Libraries\nanoflann-1.5.0\share\nanoflann\cmake"
+cmake ..
 ```
 
 ### 4. Build the project
@@ -102,6 +94,19 @@ Here's a simple example:
 #include <vector>
 #include <iostream>
 
+// Utility function to convert std::vector<Eigen::Vector3f> to LLB Features format
+template<typename T>
+std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>> convertStdEigenVectorToLLB(const std::vector<Eigen::Vector3f>& cloud)
+{
+    std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>> llb_points;
+    llb_points.reserve(cloud.size());
+    for (const auto& point: cloud) {
+        llb_points.emplace_back(point.cast<T>());
+    }
+    return llb_points;
+}
+
+
 int main() {
     // Create a simple point cloud (replace this with your actual point cloud data)
     std::vector<Eigen::Vector3f> point_cloud = {
@@ -112,7 +117,7 @@ int main() {
     };
 
     // Create an instance of LLBFeatures
-    llb_features::LLBFeatures<float> llb(point_cloud);
+    llb_features::LLBFeatures<float> llb(convertStdEigenVectorToLLB(point_cloud));
 
     // Compute the features
     auto features = llb.computeFeatures();
@@ -136,12 +141,15 @@ LLB Features can be easily integrated with Open3D point clouds. Here's an exampl
 #include <vector>
 #include <iostream>
 
+using PointCloud = open3d::geometry::PointCloud;
+
 // Utility function to convert Open3D point cloud to LLB Features format
 template<typename T>
-std::vector<Eigen::Vector3<T>> convertOpen3DToLLB(const open3d::geometry::PointCloud& point_cloud) {
-    std::vector<Eigen::Vector3<T>> llb_points;
-    llb_points.reserve(point_cloud.points_.size());
-    for (const auto& point : point_cloud.points_) {
+std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>> convertOpen3DToLLB(const PointCloud& cloud)
+{
+    std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>> llb_points;
+    llb_points.reserve(cloud.points_.size());
+    for (const auto& point: cloud.points_) {
         llb_points.emplace_back(point.cast<T>());
     }
     return llb_points;
