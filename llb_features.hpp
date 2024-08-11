@@ -96,6 +96,20 @@ public:
         buildKDTree();
     }
 
+    LLBFeatures(const AlignedVector<T>& point_cloud,
+                const AlignedVector<T>& normals,
+                size_t k_neighbors = 20,
+                size_t num_eigenvectors = 10,
+                const T normal_weight_factor = 0.1)
+        : point_cloud_(point_cloud),
+          normals_(normals),
+          k_neighbors_(k_neighbors),
+          num_eigenvectors_(num_eigenvectors),
+          normal_weight_factor_(normal_weight_factor) {
+        validateInputs();
+        buildKDTree();
+    }
+
     std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>> computeFeatures() {
         std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>> features(point_cloud_.size());
 
@@ -109,7 +123,9 @@ public:
 
 private:
     const AlignedVector<T>& point_cloud_;
+    const AlignedVector<T>& normals_ = {};
     size_t k_neighbors_;
+    T normal_weight_factor_;
     size_t num_eigenvectors_;
     LLBPointCloud<T> pc_adaptor_;
     std::unique_ptr<nanoflann::KDTreeSingleIndexAdaptor<nanoflann::L2_Simple_Adaptor<T,LLBPointCloud<T>>, LLBPointCloud<T>, 3>> kdtree_;
@@ -117,6 +133,9 @@ private:
     void validateInputs() {
         if (point_cloud_.empty()) {
             throw std::invalid_argument("Point cloud is empty");
+        }
+        if (normals_.size() > 0 && normals_.size() != point_cloud_.size()) {
+            throw std::invalid_argument("normals.size() must match point.size()");
         }
         if (k_neighbors_ < 3) {
             throw std::invalid_argument("k_neighbors must be at least 3");
@@ -147,16 +166,29 @@ private:
         kdtree_->findNeighbors(resultSet, point_cloud_[point_idx].data(), nanoflann::SearchParameters());
 
         std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>> local_cloud(k_neighbors_);
+        std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>> local_normals;
+
         for (size_t i = 0; i < k_neighbors_; ++i) {
             local_cloud[i] = point_cloud_[neighbor_indices[i]];
         }
 
-        Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> L = computeLaplaceBeltrami(local_cloud);
+        Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> L;
+
+        if (!normals_.empty()) {
+            local_normals.resize(k_neighbors_);
+            for (size_t i = 0; i < k_neighbors_; ++i) {
+                local_normals[i] = normals_[neighbor_indices[i]];
+            }
+            L = computeLaplaceBeltrami(local_cloud, local_normals);
+        } else {
+            L = computeLaplaceBeltrami(local_cloud);
+        }
 
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>> eigensolver(L);
         return eigensolver.eigenvectors().col(0).head(num_eigenvectors_);
     }
 
+    // variant without normal weighing
     Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> computeLaplaceBeltrami(
         const std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>>& local_cloud) {
 
@@ -182,6 +214,45 @@ private:
         MatrixXT D_inv_sqrt = D.cwiseInverse().cwiseSqrt().asDiagonal();
 
         return D_inv_sqrt * L * D_inv_sqrt;
+    }
+
+    // variant with normal weighing
+    Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> computeLaplaceBeltrami(
+        const std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>>& local_cloud,
+        const std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>>& local_normals) {
+
+        using MatrixXT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+        using VectorXT = Eigen::Matrix<T, Eigen::Dynamic, 1>;
+
+        MatrixXT W = MatrixXT::Zero(k_neighbors_, k_neighbors_);
+
+        #pragma omp parallel for schedule(dynamic)
+        for (int i = 0; i < static_cast<int>(k_neighbors_); ++i) {
+            for (int j = i + 1; j < static_cast<int>(k_neighbors_); ++j) {
+                T dist = (local_cloud[i] - local_cloud[j]).squaredNorm();
+                T normal_diff = (local_normals[i] - local_normals[j]).squaredNorm();
+                T weight = computeWeight(dist, normal_diff, normal_weight_factor_);
+                W(i, j) = W(j, i) = weight;
+            }
+        }
+
+        VectorXT D = W.rowwise().sum();
+        MatrixXT D_diag = D.asDiagonal();
+
+        MatrixXT L = D_diag - W;
+
+        MatrixXT D_inv_sqrt = D.cwiseInverse().cwiseSqrt().asDiagonal();
+
+        return D_inv_sqrt * L * D_inv_sqrt;
+    }
+
+    static inline T computeWeight(T x, T ndiff, const double n_w) {
+        T combined_dist = x + ndiff * n_w;
+        if (OPTIMAL_ALIGN >= 32) {
+            return computeWeightAVX(combined_dist);
+        } else {
+            return computeWeightSSE(combined_dist);
+        }
     }
 
     static inline T computeWeight(T x) {
