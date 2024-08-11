@@ -133,46 +133,147 @@ int main() {
 
 ### Usage with Open3D
 
-LLB Features can be easily integrated with Open3D point clouds. Here's an example of how to use LLB Features with an Open3D point cloud:
+LLB Features can be easily integrated with Open3D point clouds. Here's an example of how to use LLB Features with an Open3D point cloud.
+LLB Features can also use the point normals of the PointClouds if they are available.
 
 ```cpp
+// Example with normal information
+#include <iostream>
 #include <open3d/Open3D.h>
 #include <llb_features.hpp>
-#include <vector>
-#include <iostream>
 
 using PointCloud = open3d::geometry::PointCloud;
+using Feature = open3d::pipelines::registration::Feature;
 
-// Utility function to convert Open3D point cloud to LLB Features format
 template<typename T>
-std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>> convertOpen3DToLLB(const PointCloud& cloud)
-{
+std::pair<std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>>,
+          std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>>>
+convertOpen3DToLLB(const PointCloud& cloud, bool hasNormals) {
     std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>> llb_points;
+    std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>> llb_normals;
+
     llb_points.reserve(cloud.points_.size());
-    for (const auto& point: cloud.points_) {
+    for (const auto& point : cloud.points_) {
         llb_points.emplace_back(point.cast<T>());
     }
-    return llb_points;
+
+    if (hasNormals) {
+        llb_normals.reserve(cloud.normals_.size());
+        for (const auto& normal : cloud.normals_) {
+            llb_normals.emplace_back(normal.cast<T>());
+        }
+    }
+
+    return {llb_points, llb_normals};
+}
+
+template<typename T>
+Feature ConvertLLBToOpen3DFeatures(const std::vector<Eigen::Matrix<T, -1, 1, 0, -1, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, -1, 1, 0, -1, 1>>>& llb_features) {
+    int feature_dim = llb_features.front().rows();
+    int num_features = llb_features.size();
+
+    Feature open3d_features;
+    open3d_features.Resize(feature_dim, num_features);
+
+    for (int i = 0; i < num_features; ++i) {
+        for (int j = 0; j < feature_dim; ++j) {
+            open3d_features.data_(j, i) = llb_features[i](j);
+        }
+    }
+    return open3d_features;
 }
 
 int main() {
-    // Load a point cloud using Open3D
-    auto pcd = open3d::io::CreatePointCloudFromFile("path/to/your/pointcloud.ply");
+    // Load point cloud with normals
+    std::string cloud_path = "path_to_pointcloud_with_normals.ply";
+    auto cloud = open3d::io::CreatePointCloudFromFile(cloud_path);
 
-    // Convert Open3D point cloud to LLB Features format
-    auto llb_points = convertOpen3DToLLB<float>(*pcd);
+    if (!cloud || !cloud->HasNormals()) {
+        std::cerr << "Failed to load point cloud with normals" << std::endl;
+        return 1;
+    }
 
-    // Create an instance of LLBFeatures
-    llb_features::LLBFeatures<float> llb(llb_points);
+    // Convert to LLB format
+    auto [points, normals] = convertOpen3DToLLB<float>(*cloud, true);
 
-    // Compute the features
+    // Compute LLB features
+    llb_features::LLBFeatures<float> llb(points, normals, 155, 15, 0.45);
     auto features = llb.computeFeatures();
 
-    // Print the first few features
-    std::cout << "Features for the first 5 points:\n";
-    for (size_t i = 0; i < std::min(size_t(5), features.size()); ++i) {
-        std::cout << "Point " << i << ":\n" << features[i].transpose() << "\n\n";
+    // Convert LLB features to Open3D features
+    Feature o3d_features = ConvertLLBToOpen3DFeatures(features);
+
+    std::cout << "LLB features computed successfully with normals." << std::endl;
+    std::cout << "Number of features: " << features.size() << std::endl;
+    std::cout << "Feature dimension: " << features[0].rows() << std::endl;
+
+    return 0;
+}
+```
+
+Here is an example that does not use the normal information:
+
+```cpp
+// Example without normal information
+#include <iostream>
+#include <open3d/Open3D.h>
+#include <llb_features.hpp>
+
+using PointCloud = open3d::geometry::PointCloud;
+using Feature = open3d::pipelines::registration::Feature;
+
+template<typename T>
+std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>>
+convertOpen3DToLLB(const PointCloud& cloud) {
+    std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>> llb_points;
+
+    llb_points.reserve(cloud.points_.size());
+    for (const auto& point : cloud.points_) {
+        llb_points.emplace_back(point.cast<T>());
     }
+
+    return llb_points;
+}
+
+template<typename T>
+Feature ConvertLLBToOpen3DFeatures(const std::vector<Eigen::Matrix<T, -1, 1, 0, -1, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, -1, 1, 0, -1, 1>>>& llb_features) {
+    int feature_dim = llb_features.front().rows();
+    int num_features = llb_features.size();
+
+    Feature open3d_features;
+    open3d_features.Resize(feature_dim, num_features);
+
+    for (int i = 0; i < num_features; ++i) {
+        for (int j = 0; j < feature_dim; ++j) {
+            open3d_features.data_(j, i) = llb_features[i](j);
+        }
+    }
+    return open3d_features;
+}
+
+int main() {
+    // Load point cloud without normals
+    std::string cloud_path = "path_to_pointcloud_without_normals.ply";
+    auto cloud = open3d::io::CreatePointCloudFromFile(cloud_path);
+
+    if (!cloud) {
+        std::cerr << "Failed to load point cloud" << std::endl;
+        return 1;
+    }
+
+    // Convert to LLB format
+    auto points = convertOpen3DToLLB<float>(*cloud);
+
+    // Compute LLB features
+    llb_features::LLBFeatures<float> llb(points, 155, 15);
+    auto features = llb.computeFeatures();
+
+    // Convert LLB features to Open3D features
+    Feature o3d_features = ConvertLLBToOpen3DFeatures(features);
+
+    std::cout << "LLB features computed successfully without normals." << std::endl;
+    std::cout << "Number of features: " << features.size() << std::endl;
+    std::cout << "Feature dimension: " << features[0].rows() << std::endl;
 
     return 0;
 }
