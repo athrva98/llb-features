@@ -138,7 +138,7 @@ private:
     bool use_fast_approximation_;
     size_t num_samples_;
     LLBPointCloud<T> pc_adaptor_;
-    std::unique_ptr<nanoflann::KDTreeSingleIndexAdaptor<nanoflann::L2_Simple_Adaptor<T,LLBPointCloud<T>>, LLBPointCloud<T>, 3>> kdtree_;
+    std::unique_ptr<nanoflann::KDTreeSingleIndexAdaptor<nanoflann::L1_Adaptor<T,LLBPointCloud<T>>, LLBPointCloud<T>, 3>> kdtree_;
 
     void validateInputs() {
         if (point_cloud_.empty()) {
@@ -161,7 +161,7 @@ private:
     void buildKDTree() {
         pc_adaptor_.points = point_cloud_;
         kdtree_ = std::make_unique<nanoflann::KDTreeSingleIndexAdaptor<
-            nanoflann::L2_Simple_Adaptor<T, LLBPointCloud<T>>, LLBPointCloud<T>, 3>>(
+            nanoflann::L1_Adaptor<T, LLBPointCloud<T>>, LLBPointCloud<T>, 3>>(
             3, pc_adaptor_, nanoflann::KDTreeSingleIndexAdaptorParams(10));
         kdtree_->buildIndex();
     }
@@ -199,15 +199,28 @@ private:
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>> eigen_solver;
         eigen_solver.compute(L);
 
-        Eigen::Matrix<T, Eigen::Dynamic, 1> llb_features =  eigen_solver.eigenvectors().col(0).head(num_eigenvectors_);
+        // Get eigenvalues and eigenvectors
+        Eigen::Matrix<T, Eigen::Dynamic, 1> eigenvalues = eigen_solver.eigenvalues();
+        Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> eigenvectors = eigen_solver.eigenvectors();
 
-        Eigen::Matrix<T, 2, 1> curvature_features = computeCurvatureFeatures(covariance);
+        // Sort eigenvalues and eigenvectors in descending order
+        std::vector<std::pair<T, int>> eigenvalue_indices;
+        for (int i = 0; i < eigenvalues.size(); ++i) {
+            eigenvalue_indices.push_back(std::make_pair(eigenvalues(i), i));
+        }
+        std::sort(eigenvalue_indices.begin(), eigenvalue_indices.end(),
+                std::greater<std::pair<T, int>>());
 
-        // Add global curvature descriptor
-        Eigen::Matrix<T, Eigen::Dynamic, 1> combined_features(llb_features.size() + 2);
-        combined_features << llb_features, curvature_features;
+        // Compute LLB features as element-wise product of eigenvalues and eigenvectors
+        Eigen::Matrix<T, Eigen::Dynamic, 1> llb_features(num_eigenvectors_);
+        for (size_t i = 0; i < num_eigenvectors_; ++i) {
+            int idx = eigenvalue_indices[i].second;
+            llb_features(i) = std::sqrt(std::abs(eigenvalues(idx))) * eigenvectors.col(idx)(0);
+        }
 
-        return combined_features;
+        T curvature_features = computeCurvatureFeatures(covariance);
+
+        return llb_features * curvature_features;
     }
 
     // variant without normal weighing
@@ -219,7 +232,6 @@ private:
 
         MatrixXT W = MatrixXT::Zero(k_neighbors_, k_neighbors_);
 
-        #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < static_cast<int>(k_neighbors_); ++i) {
             for (int j = i + 1; j < static_cast<int>(k_neighbors_); ++j) {
                 T dist = (local_cloud[i] - local_cloud[j]).squaredNorm();
@@ -251,12 +263,9 @@ private:
 
         MatrixXT W = MatrixXT::Zero(k_neighbors_, k_neighbors_);
 
-        #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < static_cast<int>(k_neighbors_); ++i) {
             for (int j = i + 1; j < static_cast<int>(k_neighbors_); ++j) {
-                T dist = (local_cloud[i] - local_cloud[j]).squaredNorm();
-                T normal_diff = (local_normals[i] - local_normals[j]).squaredNorm();
-                T weight = computeWeight(dist, normal_diff, normal_weight_factor_);
+                T weight = computeAnisotropicWeight(local_cloud[i], local_cloud[j], local_normals[i], local_normals[j]);
                 W(i, j) = W(j, i) = weight;
             }
         }
@@ -325,7 +334,7 @@ private:
         return covariance;
     }
 
-    Eigen::Matrix<T, 2, 1> computeCurvatureFeatures(const Eigen::Matrix<T, 3, 3>& covariance_matrix) {
+    T computeCurvatureFeatures(const Eigen::Matrix<T, 3, 3>& covariance_matrix) {
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix<T, 3, 3>> eigen_solver;
         eigen_solver.computeDirect(covariance_matrix);
 
@@ -337,7 +346,7 @@ private:
 
         T sum_eigenvalues = eigenvalues.sum();
         if (sum_eigenvalues == 0) {
-            return Eigen::Matrix<T, 2, 1>::Zero();
+            return 0;
         }
         T mean_curvature = eigenvalues[1] / sum_eigenvalues;
         T gaussian_curvature = eigenvalues.prod() / (sum_eigenvalues * sum_eigenvalues);
@@ -351,7 +360,7 @@ private:
         } else {
             result << mean_curvature, gaussian_curvature;
         }
-        return result;
+        return static_cast<T>(result.squaredNorm());
     }
 
     Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> approximateLaplaceBeltrami(
@@ -402,6 +411,19 @@ private:
         VectorXT S = (U.transpose() * (ones - W * U)).cwiseQuotient(U.colwise().sum());
         // Return approximated Laplacian
         return U * S.asDiagonal() * U.transpose();
+    }
+
+    static inline T approximateGeodesicDistance(const AlignedVector3<T>& p1, const AlignedVector3<T>& p2, const AlignedVector3<T>& n1, const AlignedVector3<T>& n2) {
+        T euclidean_dist = (p1 - p2).norm();
+        T normal_diff = 1 - n1.dot(n2);
+        return euclidean_dist * (1 + normal_diff);
+    }
+
+    static inline T computeAnisotropicWeight(const AlignedVector3<T>& p1, const AlignedVector3<T>& p2,
+                                            const AlignedVector3<T>& n1, const AlignedVector3<T>& n2) {
+        T geo_dist = approximateGeodesicDistance(p1, p2, n1, n2);
+        T anisotropic_factor = std::abs(n1.dot(p1 - p2));
+        return anisotropic_factor  / (1 + geo_dist);
     }
 
     static inline T computeWeight(T x, T ndiff, const double n_w) {
