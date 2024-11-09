@@ -69,6 +69,124 @@ template <typename T>
 using AlignedVector = std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>>;
 
 template <typename T>
+class LocalGeometryAnalyzer {
+public:
+    struct LocalSurfaceDescriptor {
+        T variation;                        // Surface variation
+        T planarity;                        // Planarity measure
+        T anisotropy;                       // Local anisotropy
+        T sphericity;                       // Spherical tendency
+        AlignedVector3<T> principal_dir;    // Principal direction
+        Eigen::Matrix<T, 3, 3> covariance;  // Local covariance
+        T stability_score;                  // Feature stability estimate
+
+        LocalSurfaceDescriptor() {
+            variation = 0.0;
+            planarity = 0.0;
+            anisotropy = 0.0;
+            sphericity = 0.0;
+            principal_dir = {0, 0, 0};
+            covariance = Eigen::Matrix<T, 3, 3>::Identity();
+            stability_score = 0.0;
+        }
+    };
+
+    static LocalSurfaceDescriptor computeLocalSurfaceProperties(
+            const AlignedVector3<T>& point,
+            const std::vector<AlignedVector3<T>,
+             Eigen::aligned_allocator<AlignedVector3<T>>>& neighborhood) {
+        LocalSurfaceDescriptor desc;
+
+        // Compute robust covariance
+        desc.covariance = computeRobustCovariance(point, neighborhood);
+
+        // Eigen decomposition
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<T, 3, 3>> solver(desc.covariance);
+        auto eigenvalues = solver.eigenvalues();
+        auto eigenvectors = solver.eigenvectors();
+
+        // Sort eigenvalues in ascending order
+        if (eigenvalues(1) < eigenvalues(0)) {
+            std::swap(eigenvalues(1), eigenvalues(0));
+            eigenvectors.col(1).swap(eigenvectors.col(0));
+        }
+        if (eigenvalues(2) < eigenvalues(1)) {
+            std::swap(eigenvalues(2), eigenvalues(1));
+            eigenvectors.col(2).swap(eigenvectors.col(1));
+            if (eigenvalues(1) < eigenvalues(0)) {
+                std::swap(eigenvalues(1), eigenvalues(0));
+                eigenvectors.col(1).swap(eigenvectors.col(0));
+            }
+        }
+
+        T sum_eigenvalues = eigenvalues.sum();
+        if (sum_eigenvalues < epsilon) {
+            return desc; // Default initialized values
+        }
+
+        // Compute surface properties
+        desc.variation = eigenvalues(0) / sum_eigenvalues;
+        desc.planarity = (eigenvalues(1) - eigenvalues(0)) / eigenvalues(2);
+        desc.anisotropy = (eigenvalues(2) - eigenvalues(0)) / eigenvalues(2);
+        desc.sphericity = eigenvalues(0) / eigenvalues(2);
+        desc.principal_dir = eigenvectors.col(2);
+
+        // Compute stability score based on eigenvalue ratios
+        T e1_ratio = eigenvalues(1) / eigenvalues(2);
+        T e0_ratio = eigenvalues(0) / eigenvalues(1);
+        desc.stability_score = std::abs(e1_ratio - e0_ratio) / (1 + e1_ratio + e0_ratio);
+
+        return desc;
+    }
+
+    static Eigen::Matrix<T, 3, 3> computeRobustCovariance(
+            const AlignedVector3<T>& query,
+            const std::vector<AlignedVector3<T>,
+             Eigen::aligned_allocator<AlignedVector3<T>>>& neighborhood) {
+        if (neighborhood.size() < MIN_NEIGHBORS) {
+            return Eigen::Matrix<T, 3, 3>::Identity();
+        }
+
+        // Compute weighted covariance using Huber weights
+        Eigen::Matrix<T, 3, 3> covariance = Eigen::Matrix<T, 3, 3>::Zero();
+        std::vector<T> distances;
+        distances.reserve(neighborhood.size());
+
+        // First pass: compute distances
+        for (const auto& point : neighborhood) {
+            distances.push_back((point - query).norm());
+        }
+
+        // Compute median distance for robust scaling
+        size_t mid = distances.size() / 2;
+        std::nth_element(distances.begin(), distances.begin() + mid, distances.end());
+        T median_dist = distances[mid];
+        T huber_threshold = 1.345 * median_dist; // Huber's robust estimator constant
+
+        // Second pass: compute weighted covariance
+        T total_weight = 0;
+        for (size_t i = 0; i < neighborhood.size(); ++i) {
+            AlignedVector3<T> centered = neighborhood[i] - query;
+            T dist = distances[i];
+
+            // Huber weight
+            T weight = (dist < huber_threshold) ?
+                      1.0 : (huber_threshold / dist);
+
+            covariance += weight * (centered * centered.transpose());
+            total_weight += weight;
+        }
+
+        return covariance / total_weight;
+    }
+
+private:
+    static constexpr T epsilon = 1e-10;
+    static constexpr size_t MIN_NEIGHBORS = 5;
+
+};
+
+template <typename T>
 class alignas(OPTIMAL_ALIGN) LLBPointCloud {
 public:
     AlignedVector<T> points;
@@ -85,6 +203,8 @@ public:
 
 template <typename T>
 class alignas(OPTIMAL_ALIGN) LLBFeatures {
+    using MatrixXT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+    using VectorXT = Eigen::Matrix<T, Eigen::Dynamic, 1>;
 public:
     LLBFeatures(const AlignedVector<T>& point_cloud,
                 size_t k_neighbors = 20,
@@ -121,7 +241,7 @@ public:
     std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>> computeFeatures() {
         std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>> features(point_cloud_.size());
 
-        #pragma omp parallel for schedule(dynamic)
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < static_cast<int>(point_cloud_.size()); ++i) {
             features[i] = computeLocalFeatures(i);
         }
@@ -178,11 +298,16 @@ private:
         std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>> local_cloud(k_neighbors_);
         std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>> local_normals;
 
+        AlignedVector3<T> center = {0, 0, 0};
         for (size_t i = 0; i < k_neighbors_; ++i) {
             local_cloud[i] = point_cloud_[neighbor_indices[i]];
+            center += local_cloud[i];
         }
+        center /= local_cloud.size();
 
-        Eigen::Matrix<T, 3, 3> covariance = computeCovarianceMatrix(local_cloud);
+        Eigen::Matrix<T, 3, 3> covariance = LocalGeometryAnalyzer<T>::computeRobustCovariance(center, local_cloud);
+
+        LocalGeometryAnalyzer<T>::LocalSurfaceDescriptor desc = LocalGeometryAnalyzer<T>::computeLocalSurfaceProperties(center, local_cloud);
 
         Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> L;
 
@@ -195,32 +320,119 @@ private:
         } else {
             L = computeLaplaceBeltrami(local_cloud);
         }
+        return computeFastSpectralFeatures(L, num_eigenvectors_) * (1 + desc.stability_score);
+    }
 
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>> eigen_solver;
-        eigen_solver.compute(L);
+    // Combined approach with adaptive blocks and thresholding
+    MatrixXT computeEfficientWeights(
+            const std::vector<AlignedVector3<T>,
+            Eigen::aligned_allocator<AlignedVector3<T>>>& local_cloud,
+            const std::vector<AlignedVector3<T>,
+            Eigen::aligned_allocator<AlignedVector3<T>>>& local_normals) const {
 
-        // Get eigenvalues and eigenvectors
-        Eigen::Matrix<T, Eigen::Dynamic, 1> eigenvalues = eigen_solver.eigenvalues();
-        Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> eigenvectors = eigen_solver.eigenvectors();
+        MatrixXT W = MatrixXT::Zero(k_neighbors_, k_neighbors_);
 
-        // Sort eigenvalues and eigenvectors in descending order
-        std::vector<std::pair<T, int>> eigenvalue_indices;
-        for (int i = 0; i < eigenvalues.size(); ++i) {
-            eigenvalue_indices.push_back(std::make_pair(eigenvalues(i), i));
+        // Compute local scale using k-nearest neighbors
+        // Use at most 20 neighbors for scale
+        int k = std::min<int>(20, k_neighbors_);
+        std::vector<T> knn_distances(k_neighbors_);
+
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < k_neighbors_; ++i) {
+            std::vector<T> dists;
+            dists.reserve(k_neighbors_);
+            for (int j = 0; j < k_neighbors_; ++j) {
+                if (i != j) {
+                    dists.push_back((local_cloud[i] - local_cloud[j]).squaredNorm());
+                }
+            }
+            std::nth_element(dists.begin(), dists.begin() + k - 1, dists.end());
+            knn_distances[i] = std::sqrt(dists[k - 1]);
         }
-        std::sort(eigenvalue_indices.begin(), eigenvalue_indices.end(),
-                std::greater<std::pair<T, int>>());
 
-        // Compute LLB features as element-wise product of eigenvalues and eigenvectors
-        Eigen::Matrix<T, Eigen::Dynamic, 1> llb_features(num_eigenvectors_);
-        for (size_t i = 0; i < num_eigenvectors_; ++i) {
-            int idx = eigenvalue_indices[i].second;
-            llb_features(i) = std::sqrt(std::abs(eigenvalues(idx))) * eigenvectors.col(idx)(0);
+        // Use median of k-nn distances for scale
+        std::nth_element(knn_distances.begin(),
+                        knn_distances.begin() + k_neighbors_/2,
+                        knn_distances.end());
+        T scale = knn_distances[k_neighbors_/2];
+        T squared_scale = scale * scale;
+
+        constexpr int BLOCK_SIZE = 32;
+
+        #pragma omp parallel for schedule(dynamic)
+        for (int i = 0; i < k_neighbors_; ++i) {
+            for (int j = i + 1; j < k_neighbors_; j += BLOCK_SIZE) {
+                int block_end = std::min<int>(j + BLOCK_SIZE, k_neighbors_);
+
+                // Compute weights for block with anisotropic weighting
+                for (int k = 0; k < block_end - j; ++k) {
+                    const auto& p1 = local_cloud[i];
+                    const auto& p2 = local_cloud[j + k];
+                    const auto& n1 = local_normals[i];
+                    const auto& n2 = local_normals[j + k];
+
+                    T dist = (p1 - p2).squaredNorm();
+                    if (dist < squared_scale * static_cast<T>(9.0)) {
+                        T weight = computeAnisotropicWeight(
+                            p1, p2, n1, n2);
+                        W(i, j + k) = W(j + k, i) = weight;
+                    }
+                }
+            }
+        }
+        return W;
+    }
+
+    Eigen::Matrix<T, Eigen::Dynamic, 1> computeFastSpectralFeatures(const MatrixXT& L, int k) {
+        const int n = L.rows();
+        if(n <= 32) {
+            Eigen::SelfAdjointEigenSolver<MatrixXT> es(L);
+            Eigen::Matrix<T, Eigen::Dynamic, 1> features(k);
+            for(int i = 0; i < k; ++i) {
+                features(i) = std::sqrt(std::abs(es.eigenvalues()(i))) *
+                            es.eigenvectors().col(i)(0);
+            }
+            return features;
         }
 
-        T curvature_features = computeCurvatureFeatures(covariance);
+        // Initialize with random vector
+        VectorXT v = VectorXT::Random(n);
+        v.normalize();
 
-        return llb_features * curvature_features;
+        // Storage for Arnoldi
+        const int m = std::min(k + 5, n);
+        MatrixXT V(n, m);
+        MatrixXT H = MatrixXT::Zero(m, m);
+        V.col(0) = v;
+
+        // Modified Arnoldi iteration with reorthogonalization
+        for(int j = 0; j < m - 1; ++j) {
+            VectorXT w = L * V.col(j);
+
+            // Modified Gram-Schmidt with reorthogonalization
+            for(int i = 0; i <= j; ++i) {
+                T h = w.dot(V.col(i));
+                H(i,j) = h;
+                w -= h * V.col(i);
+            }
+
+            T norm = w.norm();
+            if(norm < 1e-10) break;
+
+            H(j + 1,j) = norm;
+            V.col(j + 1) = w / norm;
+        }
+
+        // Compute features from small eigendecomposition
+        Eigen::SelfAdjointEigenSolver<MatrixXT> es(H.topLeftCorner(m-1, m-1));
+
+        Eigen::Matrix<T, Eigen::Dynamic, 1> features(k);
+        for(int i = 0; i < k; ++i) {
+            features(i) = std::sqrt(std::abs(es.eigenvalues()(i))) *
+                        (V.leftCols(m-1) * es.eigenvectors().col(i))(0);
+        }
+
+        return features;
     }
 
     // variant without normal weighing
@@ -261,24 +473,20 @@ private:
         using MatrixXT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
         using VectorXT = Eigen::Matrix<T, Eigen::Dynamic, 1>;
 
-        MatrixXT W = MatrixXT::Zero(k_neighbors_, k_neighbors_);
-
-        for (int i = 0; i < static_cast<int>(k_neighbors_); ++i) {
-            for (int j = i + 1; j < static_cast<int>(k_neighbors_); ++j) {
-                T weight = computeAnisotropicWeight(local_cloud[i], local_cloud[j], local_normals[i], local_normals[j]);
-                W(i, j) = W(j, i) = weight;
-            }
-        }
+        MatrixXT W = computeEfficientWeights(local_cloud, local_normals);
+        MatrixXT result;
         if (use_fast_approximation_) {
-            return approximateLaplaceBeltrami(W, num_samples_);
+            result = approximateLaplaceBeltrami(W, num_samples_);
         }
         else {
             VectorXT D = W.rowwise().sum();
             MatrixXT D_diag = D.asDiagonal();
             MatrixXT L = D_diag - W;
             MatrixXT D_inv_sqrt = D.cwiseInverse().cwiseSqrt().asDiagonal();
-            return D_inv_sqrt * L * D_inv_sqrt;
+            result = D_inv_sqrt * L * D_inv_sqrt;
         }
+
+        return result;
     }
 
     // TODO: Test and optimize this
@@ -316,23 +524,6 @@ private:
     //     }
     //     k_neighbors_ = original_k_neighbors;
     // }
-
-    Eigen::Matrix<T, 3, 3> computeCovarianceMatrix(
-        const std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>>& local_cloud) {
-        Eigen::Matrix<T, 3, 1> mean = Eigen::Matrix<T, 3, 1>::Zero();
-        for (const auto& point : local_cloud) {
-            mean += point;
-        }
-        mean /= local_cloud.size();
-
-        Eigen::Matrix<T, 3, 3> covariance = Eigen::Matrix<T, 3, 3>::Identity();
-        for (const auto& point : local_cloud) {
-            Eigen::Matrix<T, 3, 1> centered = point - mean;
-            covariance += centered * centered.transpose();
-        }
-        covariance /= (local_cloud.size() - 1);
-        return covariance;
-    }
 
     T computeCurvatureFeatures(const Eigen::Matrix<T, 3, 3>& covariance_matrix) {
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix<T, 3, 3>> eigen_solver;
