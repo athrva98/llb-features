@@ -46,6 +46,7 @@
 #include <Eigen/Dense>
 #include <Eigen/Eigenvalues>
 #include <nanoflann.hpp>
+#include <optional>
 
 namespace llb_features {
 
@@ -102,6 +103,9 @@ public:
 
         // Eigen decomposition
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix<T, 3, 3>> solver(desc.covariance);
+        if (solver.info() != Eigen::Success) {
+            return desc;
+        }
         auto eigenvalues = solver.eigenvalues();
         auto eigenvectors = solver.eigenvectors();
 
@@ -125,16 +129,16 @@ public:
         }
 
         // Compute surface properties
-        desc.variation = eigenvalues(0) / sum_eigenvalues;
-        desc.planarity = (eigenvalues(1) - eigenvalues(0)) / eigenvalues(2);
-        desc.anisotropy = (eigenvalues(2) - eigenvalues(0)) / eigenvalues(2);
-        desc.sphericity = eigenvalues(0) / eigenvalues(2);
+        desc.variation = eigenvalues(0) / (epsilon + sum_eigenvalues);
+        desc.planarity = (eigenvalues(1) - eigenvalues(0)) / (epsilon + eigenvalues(2));
+        desc.anisotropy = (eigenvalues(2) - eigenvalues(0)) / (epsilon + eigenvalues(2));
+        desc.sphericity = eigenvalues(0) / (epsilon + eigenvalues(2));
         desc.principal_dir = eigenvectors.col(2);
 
         // Compute stability score based on eigenvalue ratios
-        T e1_ratio = eigenvalues(1) / eigenvalues(2);
-        T e0_ratio = eigenvalues(0) / eigenvalues(1);
-        desc.stability_score = std::abs(e1_ratio - e0_ratio) / (1 + e1_ratio + e0_ratio);
+        T e1_ratio = eigenvalues(1) / (epsilon + eigenvalues(2));
+        T e0_ratio = eigenvalues(0) / (epsilon + eigenvalues(1));
+        desc.stability_score = std::abs(e1_ratio - e0_ratio) / (epsilon + 1 + e1_ratio + e0_ratio);
 
         return desc;
     }
@@ -161,7 +165,7 @@ public:
         size_t mid = distances.size() / 2;
         std::nth_element(distances.begin(), distances.begin() + mid, distances.end());
         T median_dist = distances[mid];
-        T huber_threshold = 1.345 * median_dist; // Huber's robust estimator constant
+        T huber_threshold = std::max<T>(epsilon, 1.345 * median_dist); // Huber's robust estimator constant
 
         // Second pass: compute weighted covariance
         T total_weight = 0;
@@ -171,18 +175,18 @@ public:
 
             // Huber weight
             T weight = (dist < huber_threshold) ?
-                      1.0 : (huber_threshold / dist);
+                      1.0 : (huber_threshold / (epsilon + dist));
 
             covariance += weight * (centered * centered.transpose());
             total_weight += weight;
         }
 
-        return covariance / total_weight;
+        return covariance / (epsilon + total_weight);
     }
 
 private:
-    static constexpr T epsilon = 1e-10;
-    static constexpr size_t MIN_NEIGHBORS = 5;
+    static constexpr T epsilon = static_cast<T>(1e-10);
+    static constexpr size_t MIN_NEIGHBORS = 6;
 
 };
 
@@ -206,34 +210,55 @@ class alignas(OPTIMAL_ALIGN) LLBFeatures {
     using MatrixXT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
     using VectorXT = Eigen::Matrix<T, Eigen::Dynamic, 1>;
 public:
+    /**
+    * @brief Constructs LLBFeatures with optional fast approximation
+    * @param point_cloud Input point cloud data
+    * @param k_neighbors Number of neighbors for local analysis
+    * @param num_eigenvectors Number of eigenvectors to compute
+    * @param use_fast_approximation Whether to use fast approximation method
+    * @param num_samples Number of samples to use when fast_approximation is enabled
+    *                    (ignored when fast_approximation is false)
+    * @throws std::invalid_argument if input parameters are invalid
+    */
     LLBFeatures(const AlignedVector<T>& point_cloud,
                 size_t k_neighbors = 20,
                 size_t num_eigenvectors = 10,
                 bool use_fast_approximation = false,
-                size_t num_samples = 100)
+                std::optional<size_t> num_samples = std::nullopt)
         : point_cloud_(point_cloud),
           k_neighbors_(k_neighbors),
           num_eigenvectors_(num_eigenvectors),
           use_fast_approximation_(use_fast_approximation),
-          num_samples_(num_samples) {
+          num_samples_(use_fast_approximation ? num_samples.value_or(100) : 0) {
         validateInputs();
         buildKDTree();
     }
 
+    /**
+    * @brief Constructs LLBFeatures with optional fast approximation
+    * @param point_cloud Input point cloud data
+    * @param normals Input point cloud normals data
+    * @param k_neighbors Number of neighbors for local analysis
+    * @param num_eigenvectors Number of eigenvectors to compute
+    * @param use_fast_approximation Whether to use fast approximation method
+    * @param num_samples Number of samples to use when fast_approximation is enabled
+    *                    (ignored when fast_approximation is false)
+    * @throws std::invalid_argument if input parameters are invalid
+    */
     LLBFeatures(const AlignedVector<T>& point_cloud,
                 const AlignedVector<T>& normals,
                 size_t k_neighbors = 20,
                 size_t num_eigenvectors = 10,
                 const T normal_weight_factor = 0.1,
                 bool use_fast_approximation = false,
-                size_t num_samples = 100)
+                std::optional<size_t> num_samples = std::nullopt)
         : point_cloud_(point_cloud),
           normals_(normals),
           k_neighbors_(k_neighbors),
           num_eigenvectors_(num_eigenvectors),
           normal_weight_factor_(normal_weight_factor),
           use_fast_approximation_(use_fast_approximation),
-          num_samples_(num_samples) {
+          num_samples_(use_fast_approximation ? num_samples.value_or(100) : 0) {
         validateInputs();
         buildKDTree();
     }
@@ -250,8 +275,8 @@ public:
     }
 
 private:
-    const AlignedVector<T>& point_cloud_;
-    const AlignedVector<T>& normals_ = {};
+    const AlignedVector<T> point_cloud_;
+    const AlignedVector<T> normals_ = {};
     size_t k_neighbors_;
     T normal_weight_factor_;
     size_t num_eigenvectors_;
@@ -261,7 +286,7 @@ private:
     std::unique_ptr<nanoflann::KDTreeSingleIndexAdaptor<nanoflann::L1_Adaptor<T,LLBPointCloud<T>>, LLBPointCloud<T>, 3>> kdtree_;
 
     void validateInputs() {
-        if (point_cloud_.empty()) {
+        if (point_cloud_.size() < 6) {
             throw std::invalid_argument("Point cloud is empty");
         }
         if (normals_.size() > 0 && normals_.size() != point_cloud_.size()) {
@@ -275,6 +300,12 @@ private:
         }
         if (k_neighbors_ > point_cloud_.size()) {
             throw std::invalid_argument("k_neighbors cannot be larger than the point cloud size");
+        }
+        if (num_eigenvectors_ > k_neighbors_) {
+            throw std::invalid_argument("num_eigenvectors cannot be larger than k_neighbors");
+        }
+        if (use_fast_approximation_ && num_samples_ < 2) {
+            throw std::invalid_argument("num_samples must be at least 2 when using fast approximation");
         }
     }
 
@@ -451,18 +482,19 @@ private:
                 W(i, j) = W(j, i) = weight;
             }
         }
-
+        MatrixXT result;
         if (use_fast_approximation_) {
             // nystrom approximation for computation
-            return approximateLaplaceBeltrami(W, num_samples_);
+            result = approximateLaplaceBeltrami(W, num_samples_);
         }
         else {
             VectorXT D = W.rowwise().sum();
             MatrixXT D_diag = D.asDiagonal();
             MatrixXT L = D_diag - W;
             MatrixXT D_inv_sqrt = D.cwiseInverse().cwiseSqrt().asDiagonal();
-            return D_inv_sqrt * L * D_inv_sqrt;
+            result = D_inv_sqrt * L * D_inv_sqrt;
         }
+        return result;
     }
 
     // variant with normal weighing
@@ -635,6 +667,9 @@ private:
     }
 
     static inline T computeWeightSSE(T x) {
+        if (x > 88.3762626647949f) return 0.0f;
+        if (x < -88.3762626647949f) return 1.0f;
+
         __m128 vx = _mm_set_ss(-x);
         __m128 vresult = exp_ps(vx);
         T result;
@@ -643,6 +678,8 @@ private:
     }
 
     static inline T computeWeightAVX(T x) {
+        if (x > 88.3762626647949f) return 0.0f;
+        if (x < -88.3762626647949f) return 1.0f;
         __m256 vx = _mm256_set1_ps(-x);
         __m256 vresult = exp_ps_avx(vx);
         T result;

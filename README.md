@@ -39,7 +39,7 @@ These properties make LLB features particularly useful in various point cloud pr
 ## Prerequisites
 
 - CMake 3.12 or higher
-- C++14 compatible compiler
+- C++17 compatible compiler
 - Eigen 3.3 or higher
 - nanoflann 1.5.0 or higher
 - OpenMP (optional, but recommended for better performance)
@@ -96,35 +96,48 @@ Here's a simple example:
 
 // Utility function to convert std::vector<Eigen::Vector3f> to LLB Features format
 template<typename T>
-std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>> convertStdEigenVectorToLLB(const std::vector<Eigen::Vector3f>& cloud)
-{
-    std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>> llb_points;
+llb_features::AlignedVector<T> convertStdEigenVectorToLLB(const std::vector<Eigen::Vector3f>& cloud) {
+    llb_features::AlignedVector<T> llb_points;
     llb_points.reserve(cloud.size());
-    for (const auto& point: cloud) {
-        llb_points.emplace_back(point.cast<T>());
+    for (const auto& point : cloud) {
+        llb_points.emplace_back(point.template cast<T>());
     }
     return llb_points;
 }
 
 
 int main() {
-    // Create a simple point cloud (replace this with your actual point cloud data)
-    std::vector<Eigen::Vector3f> point_cloud = {
-        {0.0f, 0.0f, 0.0f},
-        {1.0f, 0.0f, 0.0f},
-        {0.0f, 1.0f, 0.0f},
-        {0.0f, 0.0f, 1.0f}
-    };
+    try {
+        // Create a simple point cloud
+        std::vector<Eigen::Vector3f> point_cloud = {
+            {0.0f, 0.0f, 0.0f},
+            {1.0f, 0.0f, 0.0f},
+            {0.0f, 1.0f, 0.0f},
+            {0.0f, 0.0f, 1.0f},
+            {1.0f, 1.0f, 0.0f},
+            {1.0f, 0.0f, 1.0f},
+            {0.0f, 1.0f, 1.0f}
+        };
 
-    // Create an instance of LLBFeatures
-    llb_features::LLBFeatures<float> llb(convertStdEigenVectorToLLB(point_cloud));
+        // Create an instance of LLBFeatures with safer parameters
+        llb_features::LLBFeatures<float> llb(
+            convertStdEigenVectorToLLB<float>(point_cloud),
+            3,  // k_neighbors
+            2   // num_eigenvectors
+        );
 
-    // Compute the features
-    auto features = llb.computeFeatures();
+        // Compute the features with error handling
+        std::vector<Eigen::Matrix<float, Eigen::Dynamic, 1>> features;
+        try {
+            features = llb.computeFeatures();
+        } catch (const std::exception& e) {
+            std::cerr << "Error computing features: " << e.what() << std::endl;
+            return 1;
+        }
 
-    // Print the features
-    for (size_t i = 0; i < features.size(); ++i) {
-        std::cout << "Features for point " << i << ":\n" << features[i] << "\n\n";
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
     }
 
     return 0;
@@ -135,6 +148,7 @@ int main() {
 
 LLB Features can be easily integrated with Open3D point clouds. Here's an example of how to use LLB Features with an Open3D point cloud.
 LLB Features can also use the point normals of the PointClouds if they are available.
+In general, always prefer the variant that uses normals (i.e., compute normals for point clouds). **The variant that does not use normals will be removed in the future.**
 
 ```cpp
 // Example with normal information
@@ -146,11 +160,10 @@ using PointCloud = open3d::geometry::PointCloud;
 using Feature = open3d::pipelines::registration::Feature;
 
 template<typename T>
-std::pair<std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>>,
-          std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>>>
+std::pair<llb_features::AlignedVector<T>, llb_features::AlignedVector<T>>
 convertOpen3DToLLB(const PointCloud& cloud, bool hasNormals) {
-    std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>> llb_points;
-    std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>> llb_normals;
+    llb_features::AlignedVector<T> llb_points;
+    llb_features::AlignedVector<T> llb_normals;
 
     llb_points.reserve(cloud.points_.size());
     for (const auto& point : cloud.points_) {
@@ -168,7 +181,9 @@ convertOpen3DToLLB(const PointCloud& cloud, bool hasNormals) {
 }
 
 template<typename T>
-Feature ConvertLLBToOpen3DFeatures(const std::vector<Eigen::Matrix<T, -1, 1, 0, -1, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, -1, 1, 0, -1, 1>>>& llb_features) {
+Feature ConvertLLBToOpen3DFeatures(
+    const std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>,
+    Eigen::aligned_allocator<Eigen::Matrix<T, Eigen::Dynamic, 1>>>& llb_features) {
     int feature_dim = llb_features.front().rows();
     int num_features = llb_features.size();
 
@@ -201,7 +216,7 @@ int main() {
     auto features = llb.computeFeatures();
 
     // Convert LLB features to Open3D features
-    Feature o3d_features = ConvertLLBToOpen3DFeatures(features);
+    Feature o3d_features = ConvertLLBToOpen3DFeatures<float>(features);
 
     std::cout << "LLB features computed successfully with normals." << std::endl;
     std::cout << "Number of features: " << features.size() << std::endl;
@@ -223,20 +238,30 @@ using PointCloud = open3d::geometry::PointCloud;
 using Feature = open3d::pipelines::registration::Feature;
 
 template<typename T>
-std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>>
-convertOpen3DToLLB(const PointCloud& cloud) {
-    std::vector<Eigen::Matrix<T, 3, 1, 0, 3, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, 3, 1, 0, 3, 1>>> llb_points;
+std::pair<llb_features::AlignedVector<T>, llb_features::AlignedVector<T>>
+convertOpen3DToLLB(const PointCloud& cloud, bool hasNormals) {
+    llb_features::AlignedVector<T> llb_points;
+    llb_features::AlignedVector<T> llb_normals;
 
     llb_points.reserve(cloud.points_.size());
     for (const auto& point : cloud.points_) {
         llb_points.emplace_back(point.cast<T>());
     }
 
-    return llb_points;
+    if (hasNormals) {
+        llb_normals.reserve(cloud.normals_.size());
+        for (const auto& normal : cloud.normals_) {
+            llb_normals.emplace_back(normal.cast<T>());
+        }
+    }
+
+    return {llb_points, llb_normals};
 }
 
 template<typename T>
-Feature ConvertLLBToOpen3DFeatures(const std::vector<Eigen::Matrix<T, -1, 1, 0, -1, 1>, Eigen::aligned_allocator<Eigen::Matrix<T, -1, 1, 0, -1, 1>>>& llb_features) {
+Feature ConvertLLBToOpen3DFeatures(
+    const std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>,
+    Eigen::aligned_allocator<Eigen::Matrix<T, Eigen::Dynamic, 1>>>& llb_features) {
     int feature_dim = llb_features.front().rows();
     int num_features = llb_features.size();
 
@@ -269,7 +294,7 @@ int main() {
     auto features = llb.computeFeatures();
 
     // Convert LLB features to Open3D features
-    Feature o3d_features = ConvertLLBToOpen3DFeatures(features);
+    Feature o3d_features = ConvertLLBToOpen3DFeatures<float>(features);
 
     std::cout << "LLB features computed successfully without normals." << std::endl;
     std::cout << "Number of features: " << features.size() << std::endl;
@@ -281,11 +306,23 @@ int main() {
 
 ## CMake Integration
 
-If you've installed the library, you can use it in your CMake project like this:
+If you've installed the library, you can use it in your CMake project:
 
 ```cmake
+cmake_minimum_required(VERSION 3.12)
+project(your_project)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 find_package(LLBFeatures REQUIRED)
-target_link_libraries(your_target PRIVATE LLBFeatures::llb_features)
+find_package(OpenMP REQUIRED)
+
+add_executable(your_target main.cpp)
+target_link_libraries(your_target PRIVATE
+    LLBFeatures::llb_features
+    OpenMP::OpenMP_CXX
+)
 ```
 
 ## Contributing
