@@ -1,0 +1,55 @@
+# Build
+build/
+build_*/
+out/
+cmake-build-*/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln
+*.vcxproj
+*.vcxproj.filters
+
+# Claude Code
+.claude/
+
+# Compiled
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Makefile
+
+# Data / profiling
+data/
+ios_scan*/
+vtune_results/
+*.csv
+*.png
+
+# Package managers
+vcpkg_installed/
+vcpkg.json
+CMakePresets.json
+
+# OS
+.DS_Store
+Thumbs.db

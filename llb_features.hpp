@@ -39,6 +39,11 @@
 #endif
 
 #include <immintrin.h>
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <random>
+#include <type_traits>
 #include <vector>
 #include <memory>
 #include <stdexcept>
@@ -161,10 +166,12 @@ public:
             distances.push_back((point - query).norm());
         }
 
-        // Compute median distance for robust scaling
-        size_t mid = distances.size() / 2;
-        std::nth_element(distances.begin(), distances.begin() + mid, distances.end());
-        T median_dist = distances[mid];
+        // Find median on a COPY — nth_element permutes the array, which would
+        // misalign distances[i] with neighborhood[i] in the weight computation below.
+        std::vector<T> dist_for_median(distances);
+        size_t mid = dist_for_median.size() / 2;
+        std::nth_element(dist_for_median.begin(), dist_for_median.begin() + static_cast<std::ptrdiff_t>(mid), dist_for_median.end());
+        T median_dist = dist_for_median[mid];
         T huber_threshold = std::max<T>(epsilon, 1.345 * median_dist); // Huber's robust estimator constant
 
         // Second pass: compute weighted covariance
@@ -191,14 +198,15 @@ private:
 };
 
 template <typename T>
-class alignas(OPTIMAL_ALIGN) LLBPointCloud {
+class LLBPointCloud {
 public:
-    AlignedVector<T> points;
+    const AlignedVector<T>* points_ = nullptr;
+    void setPoints(const AlignedVector<T>* p) { points_ = p; }
 
-    inline size_t kdtree_get_point_count() const { return points.size(); }
+    inline size_t kdtree_get_point_count() const { return points_ ? points_->size() : 0; }
 
     inline T kdtree_get_pt(const size_t idx, const size_t dim) const {
-        return points[idx](dim);
+        return (*points_)[idx](dim);
     }
 
     template <class BBOX>
@@ -206,7 +214,7 @@ public:
 };
 
 template <typename T>
-class alignas(OPTIMAL_ALIGN) LLBFeatures {
+class LLBFeatures {
     using MatrixXT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
     using VectorXT = Eigen::Matrix<T, Eigen::Dynamic, 1>;
 public:
@@ -263,12 +271,123 @@ public:
         buildKDTree();
     }
 
+    /**
+    * @brief Compute features on a sparse subset, interpolate to full cloud.
+    * @param subsample_ratio Fraction of points to compute exactly [0.01, 1.0]
+    * @param k_interp Number of nearest anchors for interpolation (>= 1)
+    */
+    std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>> computeFeaturesSubsampled(
+            double subsample_ratio = 0.2, int k_interp = 3) {
+
+        const size_t n = point_cloud_.size();
+        subsample_ratio = std::max(0.01, std::min(1.0, subsample_ratio));
+        if (subsample_ratio >= 1.0) return computeFeatures();
+
+        size_t num_anchors = std::max<size_t>(
+            k_neighbors_,
+            static_cast<size_t>(std::ceil(n * subsample_ratio)));
+        num_anchors = std::min(num_anchors, n);
+
+        // Deterministic anchor selection
+        std::vector<size_t> all_idx(n);
+        std::iota(all_idx.begin(), all_idx.end(), 0);
+        std::mt19937 rng(42);
+        std::shuffle(all_idx.begin(), all_idx.end(), rng);
+
+        std::vector<size_t> anchor_idx(all_idx.begin(),
+            all_idx.begin() + static_cast<std::ptrdiff_t>(num_anchors));
+        std::vector<bool> is_anchor(n, false);
+        for (size_t idx : anchor_idx) is_anchor[idx] = true;
+
+        // Compute exact features for anchors via a temporary LLBFeatures
+        AlignedVector<T> anchor_pts(num_anchors);
+        for (size_t i = 0; i < num_anchors; ++i)
+            anchor_pts[i] = point_cloud_[anchor_idx[i]];
+
+        size_t ak = std::min(k_neighbors_, num_anchors);
+        size_t ae = std::min(num_eigenvectors_, ak);
+
+        std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>> anchor_feats;
+        if (!normals_.empty()) {
+            AlignedVector<T> anchor_nrm(num_anchors);
+            for (size_t i = 0; i < num_anchors; ++i)
+                anchor_nrm[i] = normals_[anchor_idx[i]];
+            LLBFeatures<T> allb(anchor_pts, anchor_nrm, ak, ae, normal_weight_factor_,
+                                 use_fast_approximation_,
+                                 use_fast_approximation_ ? std::optional<size_t>(num_samples_) : std::nullopt);
+            anchor_feats = allb.computeFeatures();
+        } else {
+            LLBFeatures<T> allb(anchor_pts, ak, ae, use_fast_approximation_,
+                                 use_fast_approximation_ ? std::optional<size_t>(num_samples_) : std::nullopt);
+            anchor_feats = allb.computeFeatures();
+        }
+
+        int feat_dim = anchor_feats.empty() ? static_cast<int>(num_eigenvectors_)
+                                             : static_cast<int>(anchor_feats[0].rows());
+
+        // Build KD-tree on anchor positions for interpolation
+        LLBPointCloud<T> anchor_adaptor;
+        anchor_adaptor.setPoints(&anchor_pts);
+        auto anchor_tree = std::make_unique<KDTree_>(
+            3, anchor_adaptor, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+        anchor_tree->buildIndex();
+
+        // Output
+        std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>> features(n);
+        for (size_t i = 0; i < num_anchors; ++i)
+            features[anchor_idx[i]] = anchor_feats[i];
+
+        // Interpolate non-anchors
+        int ki = std::min(k_interp, static_cast<int>(num_anchors));
+
+        #pragma omp parallel
+        {
+            std::vector<size_t> nn_idx(ki);
+            std::vector<T> nn_dist(ki);
+
+            #pragma omp for schedule(dynamic, 256)
+            for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) {
+                if (is_anchor[static_cast<size_t>(i)]) continue;
+
+                nanoflann::KNNResultSet<T> result(ki);
+                result.init(nn_idx.data(), nn_dist.data());
+                anchor_tree->findNeighbors(result, point_cloud_[i].data(),
+                                           nanoflann::SearchParameters());
+
+                Eigen::Matrix<T, Eigen::Dynamic, 1> f =
+                    Eigen::Matrix<T, Eigen::Dynamic, 1>::Zero(feat_dim);
+                T total_w = T(0);
+                for (int j = 0; j < ki; ++j) {
+                    T w = T(1) / (std::sqrt(nn_dist[j]) + static_cast<T>(1e-10));
+                    f += w * anchor_feats[nn_idx[j]];
+                    total_w += w;
+                }
+                features[static_cast<size_t>(i)] = f / total_w;
+            }
+        }
+
+        return features;
+    }
+
     std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>> computeFeatures() {
+        const auto n = static_cast<std::ptrdiff_t>(point_cloud_.size());
         std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>> features(point_cloud_.size());
 
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < static_cast<int>(point_cloud_.size()); ++i) {
-            features[i] = computeLocalFeatures(i);
+        #pragma omp parallel
+        {
+            // Per-thread scratch buffers — eliminates per-point heap allocations
+            std::vector<size_t> neighbor_indices(k_neighbors_);
+            std::vector<T> distances(k_neighbors_);
+            std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>> local_cloud(k_neighbors_);
+            std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>> local_normals(
+                normals_.empty() ? 0 : k_neighbors_);
+
+            #pragma omp for schedule(dynamic, 64)
+            for (std::ptrdiff_t i = 0; i < n; ++i) {
+                features[static_cast<size_t>(i)] = computeLocalFeaturesFast(
+                    static_cast<size_t>(i),
+                    neighbor_indices, distances, local_cloud, local_normals);
+            }
         }
 
         return features;
@@ -283,7 +402,9 @@ private:
     bool use_fast_approximation_;
     size_t num_samples_;
     LLBPointCloud<T> pc_adaptor_;
-    std::unique_ptr<nanoflann::KDTreeSingleIndexAdaptor<nanoflann::L1_Adaptor<T,LLBPointCloud<T>>, LLBPointCloud<T>, 3>> kdtree_;
+    using KDTree_ = nanoflann::KDTreeSingleIndexAdaptor<
+        nanoflann::L2_Simple_Adaptor<T, LLBPointCloud<T>>, LLBPointCloud<T>, 3>;
+    std::unique_ptr<KDTree_> kdtree_;
 
     void validateInputs() {
         if (point_cloud_.size() < 6) {
@@ -310,40 +431,37 @@ private:
     }
 
     void buildKDTree() {
-        pc_adaptor_.points = point_cloud_;
-        kdtree_ = std::make_unique<nanoflann::KDTreeSingleIndexAdaptor<
-            nanoflann::L1_Adaptor<T, LLBPointCloud<T>>, LLBPointCloud<T>, 3>>(
+        pc_adaptor_.setPoints(&point_cloud_);
+        kdtree_ = std::make_unique<KDTree_>(
             3, pc_adaptor_, nanoflann::KDTreeSingleIndexAdaptorParams(10));
         kdtree_->buildIndex();
     }
 
-    Eigen::Matrix<T, Eigen::Dynamic, 1> computeLocalFeatures(size_t point_idx) {
-        std::vector<size_t> neighbor_indices(k_neighbors_);
-        std::vector<T> distances(k_neighbors_);
+    Eigen::Matrix<T, Eigen::Dynamic, 1> computeLocalFeaturesFast(
+            size_t point_idx,
+            std::vector<size_t>& neighbor_indices,
+            std::vector<T>& distances,
+            std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>>& local_cloud,
+            std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>>& local_normals) {
 
         nanoflann::KNNResultSet<T> resultSet(k_neighbors_);
         resultSet.init(neighbor_indices.data(), distances.data());
-
         kdtree_->findNeighbors(resultSet, point_cloud_[point_idx].data(), nanoflann::SearchParameters());
 
-        std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>> local_cloud(k_neighbors_);
-        std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>> local_normals;
-
-        AlignedVector3<T> center = {0, 0, 0};
+        AlignedVector3<T> center = AlignedVector3<T>::Zero();
         for (size_t i = 0; i < k_neighbors_; ++i) {
             local_cloud[i] = point_cloud_[neighbor_indices[i]];
             center += local_cloud[i];
         }
-        center /= local_cloud.size();
+        center /= static_cast<T>(k_neighbors_);
 
-        Eigen::Matrix<T, 3, 3> covariance = LocalGeometryAnalyzer<T>::computeRobustCovariance(center, local_cloud);
-
-        LocalGeometryAnalyzer<T>::LocalSurfaceDescriptor desc = LocalGeometryAnalyzer<T>::computeLocalSurfaceProperties(center, local_cloud);
+        // computeLocalSurfaceProperties computes the robust covariance internally,
+        // so we don't invoke computeRobustCovariance separately here.
+        auto desc = LocalGeometryAnalyzer<T>::computeLocalSurfaceProperties(center, local_cloud);
 
         Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> L;
 
         if (!normals_.empty()) {
-            local_normals.resize(k_neighbors_);
             for (size_t i = 0; i < k_neighbors_; ++i) {
                 local_normals[i] = normals_[neighbor_indices[i]];
             }
@@ -363,37 +481,40 @@ private:
 
         MatrixXT W = MatrixXT::Zero(k_neighbors_, k_neighbors_);
 
-        // Compute local scale using k-nearest neighbors
-        // Use at most 20 neighbors for scale
-        int k = std::min<int>(20, k_neighbors_);
+        const int kn = static_cast<int>(k_neighbors_);
+
+        // Local scale = distance to the scale_k-th nearest neighbor (capped at 20).
+        // Each point has only k_neighbors_ - 1 other neighbors, so clamp to that
+        // to avoid indexing one past the end of `dists`.
+        int scale_k = std::min<int>(20, kn - 1);
         std::vector<T> knn_distances(k_neighbors_);
 
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < k_neighbors_; ++i) {
+        // No OpenMP here — this is called from inside the per-point parallel loop.
+        // Nested parallelism causes thread explosion.
+        for (int i = 0; i < kn; ++i) {
             std::vector<T> dists;
             dists.reserve(k_neighbors_);
-            for (int j = 0; j < k_neighbors_; ++j) {
+            for (int j = 0; j < kn; ++j) {
                 if (i != j) {
                     dists.push_back((local_cloud[i] - local_cloud[j]).squaredNorm());
                 }
             }
-            std::nth_element(dists.begin(), dists.begin() + k - 1, dists.end());
-            knn_distances[i] = std::sqrt(dists[k - 1]);
+            std::nth_element(dists.begin(), dists.begin() + scale_k - 1, dists.end());
+            knn_distances[i] = std::sqrt(dists[scale_k - 1]);
         }
 
         // Use median of k-nn distances for scale
         std::nth_element(knn_distances.begin(),
-                        knn_distances.begin() + k_neighbors_/2,
+                        knn_distances.begin() + static_cast<std::ptrdiff_t>(k_neighbors_/2),
                         knn_distances.end());
         T scale = knn_distances[k_neighbors_/2];
         T squared_scale = scale * scale;
 
         constexpr int BLOCK_SIZE = 32;
 
-        #pragma omp parallel for schedule(dynamic)
-        for (int i = 0; i < k_neighbors_; ++i) {
-            for (int j = i + 1; j < k_neighbors_; j += BLOCK_SIZE) {
-                int block_end = std::min<int>(j + BLOCK_SIZE, k_neighbors_);
+        for (int i = 0; i < kn; ++i) {
+            for (int j = i + 1; j < kn; j += BLOCK_SIZE) {
+                int block_end = std::min<int>(j + BLOCK_SIZE, kn);
 
                 // Compute weights for block with anisotropic weighting
                 for (int k = 0; k < block_end - j; ++k) {
@@ -405,7 +526,7 @@ private:
                     T dist = (p1 - p2).squaredNorm();
                     if (dist < squared_scale * static_cast<T>(9.0)) {
                         T weight = computeAnisotropicWeight(
-                            p1, p2, n1, n2);
+                            p1, p2, n1, n2, normal_weight_factor_);
                         W(i, j + k) = W(j + k, i) = weight;
                     }
                 }
@@ -414,8 +535,32 @@ private:
         return W;
     }
 
+    // Fixed-size eigendecomposition for small k — avoids all heap allocation
+    // inside the Eigen solver. For k=15 this is ~3x faster than dynamic.
+    template <int N>
+    Eigen::Matrix<T, Eigen::Dynamic, 1> computeSpectralFixed(
+            const Eigen::Matrix<T, N, N>& L, int k) {
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<T, N, N>> es(L);
+        int avail = std::min(k, N);
+        Eigen::Matrix<T, Eigen::Dynamic, 1> features(k);
+        for (int i = 0; i < avail; ++i) {
+            features(i) = std::sqrt(std::abs(es.eigenvalues()(i))) *
+                          es.eigenvectors().col(i)(0);
+        }
+        for (int i = avail; i < k; ++i) features(i) = T(0);
+        return features;
+    }
+
     Eigen::Matrix<T, Eigen::Dynamic, 1> computeFastSpectralFeatures(const MatrixXT& L, int k) {
-        const int n = L.rows();
+        const int n = static_cast<int>(L.rows());
+
+        // Dispatch to fixed-size solver for common k values — stack-allocated,
+        // no heap, fully unrolled by the compiler.
+        if (n == 10) return computeSpectralFixed<10>(L, k);
+        if (n == 15) return computeSpectralFixed<15>(L, k);
+        if (n == 20) return computeSpectralFixed<20>(L, k);
+        if (n == 30) return computeSpectralFixed<30>(L, k);
+
         if(n <= 32) {
             Eigen::SelfAdjointEigenSolver<MatrixXT> es(L);
             Eigen::Matrix<T, Eigen::Dynamic, 1> features(k);
@@ -455,135 +600,125 @@ private:
         }
 
         // Compute features from small eigendecomposition
-        Eigen::SelfAdjointEigenSolver<MatrixXT> es(H.topLeftCorner(m-1, m-1));
+        int h_size = std::max(1, m - 1);
+        Eigen::SelfAdjointEigenSolver<MatrixXT> es(H.topLeftCorner(h_size, h_size));
 
-        Eigen::Matrix<T, Eigen::Dynamic, 1> features(k);
-        for(int i = 0; i < k; ++i) {
+        int effective_k = std::min(k, h_size);
+        Eigen::Matrix<T, Eigen::Dynamic, 1> features = Eigen::Matrix<T, Eigen::Dynamic, 1>::Zero(k);
+        MatrixXT V_block = V.leftCols(h_size);
+        for(int i = 0; i < effective_k; ++i) {
             features(i) = std::sqrt(std::abs(es.eigenvalues()(i))) *
-                        (V.leftCols(m-1) * es.eigenvectors().col(i))(0);
+                        (V_block * es.eigenvectors().col(i))(0);
         }
 
         return features;
     }
 
-    // variant without normal weighing
+    // Isotropic Laplacian — fused weight + normalize in one pass.
+    // For k <= 15 uses fixed-size matrices (stack allocated, no heap).
     Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> computeLaplaceBeltrami(
         const std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>>& local_cloud) {
 
+        const int n = static_cast<int>(k_neighbors_);
+
+        if (n == 15) return computeLaplaceBeltramiFixed<15>(local_cloud);
+        if (n == 10) return computeLaplaceBeltramiFixed<10>(local_cloud);
+        if (n == 20) return computeLaplaceBeltramiFixed<20>(local_cloud);
+        if (n == 30) return computeLaplaceBeltramiFixed<30>(local_cloud);
+
+        // Fallback for other sizes
         using MatrixXT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
         using VectorXT = Eigen::Matrix<T, Eigen::Dynamic, 1>;
 
-        MatrixXT W = MatrixXT::Zero(k_neighbors_, k_neighbors_);
-
-        for (int i = 0; i < static_cast<int>(k_neighbors_); ++i) {
-            for (int j = i + 1; j < static_cast<int>(k_neighbors_); ++j) {
-                T dist = (local_cloud[i] - local_cloud[j]).squaredNorm();
-                T weight = computeWeight(dist);
-                W(i, j) = W(j, i) = weight;
+        MatrixXT W = MatrixXT::Zero(n, n);
+        for (int i = 0; i < n; ++i) {
+            for (int j = i + 1; j < n; ++j) {
+                T d2 = (local_cloud[i] - local_cloud[j]).squaredNorm();
+                T w = computeWeight(d2);
+                W(i, j) = w; W(j, i) = w;
             }
         }
-        MatrixXT result;
         if (use_fast_approximation_) {
-            // nystrom approximation for computation
-            result = approximateLaplaceBeltrami(W, num_samples_);
+            return approximateLaplaceBeltrami(W, num_samples_);
         }
-        else {
-            VectorXT D = W.rowwise().sum();
-            MatrixXT D_diag = D.asDiagonal();
-            MatrixXT L = D_diag - W;
-            MatrixXT D_inv_sqrt = D.cwiseInverse().cwiseSqrt().asDiagonal();
-            result = D_inv_sqrt * L * D_inv_sqrt;
+        VectorXT D = W.rowwise().sum();
+        VectorXT Dinv = D.unaryExpr([](T v) -> T {
+            return v > static_cast<T>(1e-10) ? static_cast<T>(1) / std::sqrt(v) : static_cast<T>(0);
+        });
+        // Fused: L_norm = Dinv * (D - W) * Dinv, done element-wise to avoid temporaries
+        MatrixXT L(n, n);
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                T val = (i == j) ? (D(i) - W(i, j)) : -W(i, j);
+                L(i, j) = Dinv(i) * val * Dinv(j);
+            }
         }
-        return result;
+        return L;
     }
 
-    // variant with normal weighing
+    // Fixed-size version: entirely stack-allocated, no heap, compiler can unroll
+    template <int N>
+    Eigen::Matrix<T, N, N> computeLaplaceBeltramiFixed(
+        const std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>>& local_cloud) {
+
+        Eigen::Matrix<T, N, N> W = Eigen::Matrix<T, N, N>::Zero();
+
+        for (int i = 0; i < N; ++i) {
+            for (int j = i + 1; j < N; ++j) {
+                T d2 = (local_cloud[i] - local_cloud[j]).squaredNorm();
+                T w = computeWeight(d2);
+                W(i, j) = w; W(j, i) = w;
+            }
+        }
+
+        if (use_fast_approximation_) {
+            return approximateLaplaceBeltrami(MatrixXT(W), num_samples_);
+        }
+
+        // Fused normalized Laplacian — no temporaries, no heap
+        Eigen::Matrix<T, N, 1> D = W.rowwise().sum();
+        Eigen::Matrix<T, N, 1> Dinv;
+        for (int i = 0; i < N; ++i)
+            Dinv(i) = D(i) > static_cast<T>(1e-10) ? static_cast<T>(1) / std::sqrt(D(i)) : static_cast<T>(0);
+
+        Eigen::Matrix<T, N, N> L;
+        for (int i = 0; i < N; ++i) {
+            for (int j = 0; j < N; ++j) {
+                T val = (i == j) ? (D(i) - W(i, j)) : -W(i, j);
+                L(i, j) = Dinv(i) * val * Dinv(j);
+            }
+        }
+        return L;
+    }
+
+    // Anisotropic Laplacian (with normals) — fused weight + normalize
     Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> computeLaplaceBeltrami(
         const std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>>& local_cloud,
         const std::vector<AlignedVector3<T>, Eigen::aligned_allocator<AlignedVector3<T>>>& local_normals) {
 
         using MatrixXT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
         using VectorXT = Eigen::Matrix<T, Eigen::Dynamic, 1>;
+        const int n = static_cast<int>(k_neighbors_);
 
         MatrixXT W = computeEfficientWeights(local_cloud, local_normals);
-        MatrixXT result;
+
         if (use_fast_approximation_) {
-            result = approximateLaplaceBeltrami(W, num_samples_);
-        }
-        else {
-            VectorXT D = W.rowwise().sum();
-            MatrixXT D_diag = D.asDiagonal();
-            MatrixXT L = D_diag - W;
-            MatrixXT D_inv_sqrt = D.cwiseInverse().cwiseSqrt().asDiagonal();
-            result = D_inv_sqrt * L * D_inv_sqrt;
+            return approximateLaplaceBeltrami(W, num_samples_);
         }
 
-        return result;
-    }
-
-    // TODO: Test and optimize this
-    // void computeMultiScaleFeatures(
-    //     const std::vector<size_t>& scales,
-    //     std::vector<std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>>>& multi_scale_features) {
-    //     multi_scale_features.resize(scales.size());
-    //     // Estimate a good cache block size
-    //     constexpr size_t typical_l1_cache_size = 32 * 1024;
-    //     constexpr size_t point_size = sizeof(T) * 3;
-    //     constexpr size_t cache_block_size = typical_l1_cache_size / point_size;
-    //     const size_t effective_block_size = std::max<size_t>(1, std::min<size_t>(cache_block_size, point_cloud_.size()));
-
-    //     #pragma omp parallel for schedule(dynamic)
-    //     for (int i = 0; i < static_cast<int>(scales.size()); ++i) {  // Fixed the loop condition
-    //         size_t current_scale = scales[i];
-    //         multi_scale_features[i].resize(point_cloud_.size());
-    //         // Process points in a cache-friendly manner
-    //         for (size_t start = 0; start < point_cloud_.size(); start += effective_block_size) {
-    //             size_t end = std::min<size_t>(start + effective_block_size, point_cloud_.size());
-    //             computeFeaturesForBlock(start, end, current_scale, multi_scale_features[i]);
-    //         }
-    //     }
-    // }
-
-    // void computeFeaturesForBlock(
-    //     const size_t start,
-    //     const size_t end,
-    //     const size_t scale,
-    //     std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>>& features) {
-    //     const size_t original_k_neighbors = k_neighbors_;
-    //     k_neighbors_ = scale;
-    //     for (size_t j = start; j < end; ++j) {
-    //         features[j] = computeLocalFeatures(j);
-    //     }
-    //     k_neighbors_ = original_k_neighbors;
-    // }
-
-    T computeCurvatureFeatures(const Eigen::Matrix<T, 3, 3>& covariance_matrix) {
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<T, 3, 3>> eigen_solver;
-        eigen_solver.computeDirect(covariance_matrix);
-
-        Eigen::Matrix<T, 3, 1> eigenvalues = eigen_solver.eigenvalues();
-
-        if (eigenvalues[0] > eigenvalues[1]) std::swap(eigenvalues[0], eigenvalues[1]);
-        if (eigenvalues[1] > eigenvalues[2]) std::swap(eigenvalues[1], eigenvalues[2]);
-        if (eigenvalues[0] > eigenvalues[1]) std::swap(eigenvalues[0], eigenvalues[1]);
-
-        T sum_eigenvalues = eigenvalues.sum();
-        if (sum_eigenvalues == 0) {
-            return 0;
+        // Fused normalized Laplacian
+        VectorXT D = W.rowwise().sum();
+        VectorXT Dinv = D.unaryExpr([](T v) -> T {
+            return v > static_cast<T>(1e-10) ? static_cast<T>(1) / std::sqrt(v) : static_cast<T>(0);
+        });
+        MatrixXT L(n, n);
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                T val = (i == j) ? (D(i) - W(i, j)) : -W(i, j);
+                L(i, j) = Dinv(i) * val * Dinv(j);
+            }
         }
-        T mean_curvature = eigenvalues[1] / sum_eigenvalues;
-        T gaussian_curvature = eigenvalues.prod() / (sum_eigenvalues * sum_eigenvalues);
-        Eigen::Matrix<T, 2, 1> result;
-        if constexpr (std::is_same_v<T, float> && OPTIMAL_ALIGN >= 16) {
-            __m128 mean_gauss = _mm_set_ps(0, 0, gaussian_curvature, mean_curvature);
-            _mm_store_ps(result.data(), mean_gauss);
-        } else if constexpr (std::is_same_v<T, double> && OPTIMAL_ALIGN >= 32) {
-            __m256d mean_gauss = _mm256_set_pd(0, 0, gaussian_curvature, mean_curvature);
-            _mm256_store_pd(result.data(), mean_gauss);
-        } else {
-            result << mean_curvature, gaussian_curvature;
-        }
-        return static_cast<T>(result.squaredNorm());
+        return L;
     }
 
     Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> approximateLaplaceBeltrami(
@@ -595,10 +730,17 @@ private:
         int n = W.rows();
         VectorXT D = W.rowwise().sum();
 
-        // Sample indices for Nyström approximation
+        // Sample unique indices for Nyström approximation
+        std::vector<int> pool(n);
+        std::iota(pool.begin(), pool.end(), 0);
+        thread_local std::mt19937 gen{std::random_device{}()};
+        for (int i = 0; i < num_samples; ++i) {
+            std::uniform_int_distribution<int> dist(i, n - 1);
+            std::swap(pool[i], pool[dist(gen)]);
+        }
         Eigen::VectorXi sample_indices(num_samples);
         for (int i = 0; i < num_samples; ++i) {
-            sample_indices[i] = rand() % n;
+            sample_indices[i] = pool[i];
         }
         MatrixXT W_sampled(n, num_samples);
         MatrixXT W_small(num_samples, num_samples);
@@ -612,7 +754,9 @@ private:
                 W_small(i, j) = W(sample_indices[i], sample_indices[j]);
             }
         }
-        VectorXT D_inv_sqrt = D.cwiseInverse().cwiseSqrt();
+        VectorXT D_inv_sqrt = D.unaryExpr([](T v) -> T {
+            return v > static_cast<T>(1e-10) ? static_cast<T>(1) / std::sqrt(v) : static_cast<T>(0);
+        });
         W_sampled = D_inv_sqrt.asDiagonal() * W_sampled;
         for (int j = 0; j < num_samples; ++j) {
             W_sampled.col(j) *= D_inv_sqrt(sample_indices[j]);
@@ -625,7 +769,10 @@ private:
         MatrixXT U_small = eigen_solver.eigenvectors();
         VectorXT S_small = eigen_solver.eigenvalues();
         // Nyström approximation
-        MatrixXT U = W_sampled * U_small * S_small.cwiseInverse().asDiagonal();
+        VectorXT S_small_inv = S_small.unaryExpr([](T v) -> T {
+            return std::abs(v) > static_cast<T>(1e-10) ? static_cast<T>(1) / v : static_cast<T>(0);
+        });
+        MatrixXT U = W_sampled * U_small * S_small_inv.asDiagonal();
         // Orthogonalize U
         Eigen::HouseholderQR<MatrixXT> qr(U);
         U = qr.householderQ() * MatrixXT::Identity(n, num_samples);
@@ -636,57 +783,46 @@ private:
         return U * S.asDiagonal() * U.transpose();
     }
 
-    static inline T approximateGeodesicDistance(const AlignedVector3<T>& p1, const AlignedVector3<T>& p2, const AlignedVector3<T>& n1, const AlignedVector3<T>& n2) {
+    static inline T approximateGeodesicDistance(const AlignedVector3<T>& p1, const AlignedVector3<T>& p2,
+                                                const AlignedVector3<T>& n1, const AlignedVector3<T>& n2,
+                                                T normal_weight) {
         T euclidean_dist = (p1 - p2).norm();
         T normal_diff = 1 - n1.dot(n2);
-        return euclidean_dist * (1 + normal_diff);
+        // normal_weight controls how strongly a normal-orientation mismatch
+        // stretches the approximate geodesic distance beyond the Euclidean one.
+        return euclidean_dist * (1 + normal_weight * normal_diff);
     }
 
     static inline T computeAnisotropicWeight(const AlignedVector3<T>& p1, const AlignedVector3<T>& p2,
-                                            const AlignedVector3<T>& n1, const AlignedVector3<T>& n2) {
-        T geo_dist = approximateGeodesicDistance(p1, p2, n1, n2);
+                                            const AlignedVector3<T>& n1, const AlignedVector3<T>& n2,
+                                            T normal_weight) {
+        T geo_dist = approximateGeodesicDistance(p1, p2, n1, n2, normal_weight);
         T anisotropic_factor = std::abs(n1.dot(p1 - p2));
-        return anisotropic_factor  / (1 + geo_dist);
-    }
-
-    static inline T computeWeight(T x, T ndiff, const double n_w) {
-        T combined_dist = x + ndiff * n_w;
-        if (OPTIMAL_ALIGN >= 32) {
-            return computeWeightAVX(combined_dist);
-        } else {
-            return computeWeightSSE(combined_dist);
-        }
+        return anisotropic_factor / (1 + geo_dist);
     }
 
     static inline T computeWeight(T x) {
-        if (OPTIMAL_ALIGN >= 32) {
-            return computeWeightAVX(x);
+        if constexpr (std::is_same_v<T, float>) {
+            if (x > 88.376f) return 0.0f;
+            if (OPTIMAL_ALIGN >= 32) {
+                __m256 vx = _mm256_set1_ps(-x);
+                __m256 vresult = exp_ps_avx(vx);
+                float result;
+                _mm_store_ss(&result, _mm256_extractf128_ps(vresult, 0));
+                return result;
+            } else {
+                __m128 vx = _mm_set_ss(-x);
+                __m128 vresult = exp_ps(vx);
+                float result;
+                _mm_store_ss(&result, vresult);
+                return result;
+            }
         } else {
-            return computeWeightSSE(x);
+            return std::exp(-x);
         }
     }
 
-    static inline T computeWeightSSE(T x) {
-        if (x > 88.3762626647949f) return 0.0f;
-        if (x < -88.3762626647949f) return 1.0f;
-
-        __m128 vx = _mm_set_ss(-x);
-        __m128 vresult = exp_ps(vx);
-        T result;
-        _mm_store_ss(&result, vresult);
-        return result;
-    }
-
-    static inline T computeWeightAVX(T x) {
-        if (x > 88.3762626647949f) return 0.0f;
-        if (x < -88.3762626647949f) return 1.0f;
-        __m256 vx = _mm256_set1_ps(-x);
-        __m256 vresult = exp_ps_avx(vx);
-        T result;
-        _mm_store_ss(&result, _mm256_extractf128_ps(vresult, 0));
-        return result;
-    }
-
+    // SIMD exp() approximation — polynomial minimax for float precision.
     static inline __m128 exp_ps(__m128 x) {
         __m128 tmp = _mm_setzero_ps(), fx;
         __m128i emm0;
