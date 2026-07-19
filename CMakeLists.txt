@@ -63,3 +63,8 @@ install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/LLBFeaturesConfig.cmake"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/LLBFeatures
 )
+
+option(LLB_BUILD_TESTS "Build tests" OFF)
+if(LLB_BUILD_TESTS)
+    add_subdirectory(tests)
+endif()
